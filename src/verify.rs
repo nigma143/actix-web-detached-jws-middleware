@@ -1,7 +1,11 @@
-use std::pin::Pin;
-use std::rc::Rc;
-use std::task::{Context, Poll};
+use core::future;
+use std::{
+    any::Any,
+    task::{Context, Poll},
+};
+use std::{borrow::BorrowMut, pin::Pin};
 use std::{cell::RefCell, io::Write};
+use std::{fmt::Display, rc::Rc};
 
 use actix_service::{Service, Transform};
 use actix_web::{dev::ServiceRequest, dev::ServiceResponse, Error, HttpMessage};
@@ -14,60 +18,74 @@ use detached_jws::{DeserializeJwsWriter, JwsHeader, Verify};
 use futures::future::{ok, Future, LocalBoxFuture, Ready};
 use futures::stream::StreamExt;
 
-pub struct DetachedJwsVerify<VS> {
-    pub selector: Rc<VS>,
+pub type ShouldVerify = bool;
+
+pub struct MiddlewareOptions<S> {
+    pub verify_selector: S,
+    pub should_verify: Option<Box<dyn Fn(&mut ServiceRequest) -> ShouldVerify>>,
 }
 
-impl<VS, V> DetachedJwsVerify<VS>
-where
-    VS: Fn(&JwsHeader) -> Option<V>,
-    V: Verify,
-{
-    pub fn new(selector: VS) -> Self {
+pub struct DetachedJwsVerify<S> {
+    pub options: Rc<MiddlewareOptions<S>>,
+}
+
+impl<S> DetachedJwsVerify<S> {
+    pub fn new(selector: S) -> Self {
         Self {
-            selector: Rc::new(selector),
+            options: Rc::new(MiddlewareOptions {
+                verify_selector: selector,
+                should_verify: None,
+            }),
         }
+    }
+
+    pub fn should_verify<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut ServiceRequest) -> ShouldVerify + 'static,
+    {
+        Rc::get_mut(&mut self.options).unwrap().should_verify = Some(Box::new(f));
+        self
     }
 }
 
-impl<S, B, VS, V> Transform<S> for DetachedJwsVerify<VS>
+impl<S, B, SV, V> Transform<S> for DetachedJwsVerify<SV>
 where
     S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
-    VS: Fn(&JwsHeader) -> Option<V> + 'static,
-    V: Verify,
+    SV: Fn(&JwsHeader) -> Option<V> + 'static,
+    V: Verify + 'static,
 {
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
     type Error = Error;
     type InitError = ();
-    type Transform = DetachedJwsVerifyService<S, VS>;
+    type Transform = Middleware<S, SV>;
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
-        let selector = self.selector.clone();
+        let options = self.options.clone();
 
-        ok(DetachedJwsVerifyService {
+        ok(Middleware {
             service: Rc::new(RefCell::new(service)),
-            selector: selector,
+            options: options,
         })
     }
 }
 
-pub struct DetachedJwsVerifyService<S, VS> {
+pub struct Middleware<S, SV> {
     // This is special: We need this to avoid lifetime issues.
     service: Rc<RefCell<S>>,
-    selector: Rc<VS>,
+    options: Rc<MiddlewareOptions<SV>>,
 }
 
-impl<S, B, VS, V> Service for DetachedJwsVerifyService<S, VS>
+impl<S, B, SV, V> Service for Middleware<S, SV>
 where
     S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: 'static,
-    VS: Fn(&JwsHeader) -> Option<V> + 'static,
-    V: Verify,
+    SV: Fn(&JwsHeader) -> Option<V> + 'static,
+    V: Verify + 'static,
 {
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
@@ -80,18 +98,26 @@ where
 
     fn call(&mut self, mut req: ServiceRequest) -> Self::Future {
         let mut svc = self.service.clone();
-        let selector = self.selector.clone();
+        let options = self.options.clone();
 
         Box::pin(async move {
+            
+            let should_verify = match options.should_verify {
+                Some(ref f) => f(&mut req),
+                None => true,
+            };
+
+
             let jws = match req.headers().get("X-JWS-Signature") {
                 Some(h) => h,
                 None => Err(ErrorBadRequest("`X-JWS-Signature` header not declared"))?,
             };
 
-            let mut encoder = match DeserializeJwsWriter::new(&jws, |h| selector(h)) {
-                Ok(o) => o,
-                Err(e) => Err(ErrorBadRequest(e))?,
-            };
+            let mut encoder =
+                match DeserializeJwsWriter::new(&jws, |h| (options.verify_selector)(h)) {
+                    Ok(o) => o,
+                    Err(e) => Err(ErrorBadRequest(e))?,
+                };
 
             let mut stream = req.take_payload();
             while let Some(chunk) = stream.next().await {

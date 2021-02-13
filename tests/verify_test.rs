@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate lazy_static;
 
+use std::rc::Rc;
+
 use actix_service::{IntoService, Transform};
 use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
@@ -9,8 +11,9 @@ use actix_web::{
     test::{self, TestRequest},
     HttpResponse,
 };
-use actix_web_detached_jws_middleware::verify::DetachedJwsVerify;
+use actix_web_detached_jws_middleware::verify::{DetachedJwsVerify, MiddlewareOptions};
 use detached_jws::JwsHeader;
+use futures::Future;
 use openssl::{
     hash::MessageDigest,
     pkey::PKey,
@@ -42,7 +45,7 @@ async fn test_handler() {
     let srv =
         |req: ServiceRequest| futures::future::ok(req.into_response(HttpResponse::Ok().finish()));
 
-    let mut mw = DetachedJwsVerify::new(|_| -> Option<Verifier> {
+    let mut mw = DetachedJwsVerify::new(|h: &JwsHeader| -> Option<Verifier> {
         let mut verifier = Verifier::new(MessageDigest::sha256(), &KEYPAIR_PS256).unwrap();
         verifier.set_rsa_padding(Padding::PKCS1_PSS).unwrap();
         Some(verifier)
@@ -51,7 +54,7 @@ async fn test_handler() {
     .await
     .unwrap();
 
-    let resp = test::call_service(
+    let _ = test::call_service(
         &mut mw,
         TestRequest::default()
             .header("X-JWS-Signature", jws)
