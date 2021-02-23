@@ -1,13 +1,24 @@
-use std::{fmt::Display, pin::Pin, rc::Rc};
+use std::{fmt::Display, marker::PhantomData, pin::Pin, rc::Rc};
 
-use actix_service::boxed::factory;
-use actix_web::{App, HttpMessage, HttpResponse, HttpServer, Responder, dev::ServiceRequest, get, middleware::errhandlers::ErrorHandlers, rt::blocking, web::{self, BytesMut}};
+use actix_service::{boxed::factory, Service};
+use actix_web::{
+    dev::ServiceRequest,
+    error::ErrorForbidden,
+    get,
+    middleware::errhandlers::ErrorHandlers,
+    rt::blocking,
+    web::{self, BytesMut},
+    App, FromRequest, HttpMessage, HttpResponse, HttpServer, Responder,
+};
 use actix_web_detached_jws_middleware::verify::{
-    DetachedJwsVerify, MiddlewareOptions, ShouldVerify,
+    DetachedJwsVerify, MiddlewareOptions, ShouldVerify, VerifyErrorType,
 };
 use detached_jws::JwsHeader;
 use executor::block_on_stream;
-use futures::{executor, future::{FutureExt, LocalBoxFuture}};
+use futures::{
+    executor,
+    future::{FutureExt, LocalBoxFuture},
+};
 use futures::{Future, StreamExt};
 use openssl::sign::Verifier;
 
@@ -20,63 +31,37 @@ fn aaa(n: &JwsHeader) -> Option<Verifier<'static>> {
     None
 }
 
-async fn a_should(req: &mut ServiceRequest) -> bool {
+async fn should_verify(mut req: ServiceRequest) -> (ServiceRequest, ShouldVerify) {
     let mut body = BytesMut::new();
     let mut stream = req.take_payload();
     while let Some(chunk) = stream.next().await {
         body.extend_from_slice(&chunk.unwrap());
     }
 
-    println!("request body: {:?}", body);
+    //println!("request body: {:?}", body);
 
-    false
+    (req, true)
 }
 
-fn should(req: &mut ServiceRequest) -> ShouldVerify {
-    
-    println!("here1");
-
-    let jws = req.headers().get("X-JWS-Signature");
-
-    let mut body = BytesMut::new();
-    //req.take_payload().
-    println!("here2");
-    let stream = req.take_payload();
-    
-    let mut das = executor::block_on_stream(stream);
-    
-    println!("here3");
-    while let Some(chunk) = das.next() {
-        
-    println!("here4");
-        body.extend_from_slice(&chunk.unwrap());
-    }
-
-    println!("request body: {:?}", body);
-
-    false
-}
-
-struct TestS {
-    fun: Box<dyn Fn(usize) -> LocalBoxFuture<'static, usize>>
-}
-
-impl TestS {
-    fn new(f: dyn Fn(usize) -> LocalBoxFuture<'static, usize>) -> Self
-     {
-         Self {
-             fun: Box::new(f)
-         }
-
+async fn error_handler(
+    _req: ServiceRequest,
+    error_type: VerifyErrorType,
+) -> actix_web::error::Error {
+    match error_type {
+        VerifyErrorType::HeaderNotFound => ErrorForbidden("Header Not Found"),
+        VerifyErrorType::IncorrectSignature => ErrorForbidden("Incorrect Signature"),
+        VerifyErrorType::Other => ErrorForbidden("Other"),
     }
 }
+
+//aync fn mv(s: &mut ServiceRequest, r: &mut AppRouting) ->
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
             .wrap(
-                DetachedJwsVerify::new(aaa).should_verify(should)
+                DetachedJwsVerify::new(aaa).should_verify(should_verify).error_handler(error_handler)
                 //DetachedJwsVerify::new(|h: &JwsHeader| -> Option<Verifier> {None})
                 //DetachedJwsVerify::new(aaa).should_verify(should),
             )
