@@ -12,12 +12,15 @@ actix-web = { version = "3" }
 actix-service = "1.0"
 detached-jws = "0.2.1"
 anyhow = "1.0.38"
+uuid = { version = "0.8.2", features = ["v4"] }
+pin-project = "1"
 
 [dev-dependencies]
 openssl = "0.10.32"
 actix-rt = "2.0.2"
 lazy_static = "1.4.0"
 anyhow = "1.0.38"
+pin-project = "1"
 
 [[example]]
 name = "main" # examples/main.rs
