@@ -1,32 +1,21 @@
-use core::future;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::{cell::RefCell, io::Write};
 use std::{
-    any::Any,
-    marker::PhantomData,
     sync::Arc,
     task::{Context, Poll},
 };
-use std::{borrow::BorrowMut, pin::Pin};
-use std::{cell::RefCell, io::Write};
-use std::{fmt::Display, rc::Rc};
 
 use actix_service::{Service, Transform};
 use actix_web::{
     dev::ServiceRequest,
-    dev::{MessageBody, ServiceResponse},
+    dev::{Body, ServiceResponse},
     Error, HttpMessage,
 };
-use actix_web::{
-    error::{ErrorBadRequest, ErrorUnauthorized},
-    web::BytesMut,
-    HttpResponse,
-};
+use actix_web_buffering::{enable_request_buffering, FileBufferingStreamWrapper};
 use detached_jws::{DeserializeJwsWriter, JwsHeader, Verify};
 use futures::future::{ok, Future, Ready};
-use futures::stream::StreamExt;
-
-use crate::buffering::{self, enable_request_buffering, FileBufferingStreamBuilder};
-
-pub type ShouldVerify = bool;
+use futures::{stream::StreamExt, FutureExt};
 
 pub enum VerifyErrorType {
     HeaderNotFound,
@@ -34,14 +23,11 @@ pub enum VerifyErrorType {
     Other(anyhow::Error),
 }
 
-pub trait DetachedJwsConfig<'a> {
+pub trait DetachedJwsVerifyConfig<'a> {
     type Verifier: Verify;
-    type ShouldVerify: Future<Output = ShouldVerify>;
     type ErrorHandler: Future<Output = Error>;
 
     fn get_verifier(&'a self, h: &JwsHeader) -> Option<Self::Verifier>;
-
-    fn should_verify(&'a self, req: &'a mut ServiceRequest) -> Self::ShouldVerify;
 
     fn error_handler(
         &'a self,
@@ -52,31 +38,30 @@ pub trait DetachedJwsConfig<'a> {
 
 pub struct DetachedJwsVerify<T> {
     config: Arc<T>,
-    buffering_config: Arc<FileBufferingStreamBuilder>,
+    buffering: Rc<FileBufferingStreamWrapper>,
 }
 
 impl<T> DetachedJwsVerify<T> {
     pub fn new(config: Arc<T>) -> Self {
         Self {
             config,
-            buffering_config: Arc::new(FileBufferingStreamBuilder::new()),
+            buffering: Rc::new(FileBufferingStreamWrapper::new()),
         }
     }
 
-    pub fn use_buffering(mut self, builder: Arc<FileBufferingStreamBuilder>) -> Self {
-        self.buffering_config = builder;
+    pub fn override_buffering(mut self, v: Rc<FileBufferingStreamWrapper>) -> Self {
+        self.buffering = v;
         self
     }
 }
 
-impl<S, B, T> Transform<S> for DetachedJwsVerify<T>
+impl<S, T> Transform<S> for DetachedJwsVerify<T>
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    B: MessageBody + 'static,
-    T: for<'a> DetachedJwsConfig<'a> + 'static,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<Body>, Error = Error> + 'static,
+    T: for<'a> DetachedJwsVerifyConfig<'a> + 'static,
 {
     type Request = ServiceRequest;
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<Body>;
     type Error = Error;
     type InitError = ();
     type Transform = Middleware<S, T>;
@@ -86,7 +71,7 @@ where
         ok(Middleware {
             service: Rc::new(RefCell::new(service)),
             config: Arc::clone(&self.config),
-            buffering_config: Arc::clone(&self.buffering_config),
+            buffering: Rc::clone(&self.buffering),
         })
     }
 }
@@ -95,17 +80,16 @@ pub struct Middleware<S, T> {
     // This is special: We need this to avoid lifetime issues.
     service: Rc<RefCell<S>>,
     config: Arc<T>,
-    buffering_config: Arc<FileBufferingStreamBuilder>,
+    buffering: Rc<FileBufferingStreamWrapper>,
 }
 
-impl<S, B, T> Service for Middleware<S, T>
+impl<S, T> Service for Middleware<S, T>
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
-    B: MessageBody + 'static,
-    T: for<'a> DetachedJwsConfig<'a> + 'static,
+    S: Service<Request = ServiceRequest, Response = ServiceResponse<Body>, Error = Error> + 'static,
+    T: for<'a> DetachedJwsVerifyConfig<'a> + 'static,
 {
     type Request = ServiceRequest;
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse<Body>;
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
 
@@ -117,51 +101,43 @@ where
         let mut svc = self.service.clone();
         let config = self.config.clone();
 
-        enable_request_buffering(&self.buffering_config, &mut req);
+        enable_request_buffering(&self.buffering, &mut req);
 
-        Box::pin(async move {
-            let should_verify = config.should_verify(&mut req).await;
-
-            if should_verify {
-                let jws = match req.headers().get("X-JWS-Signature") {
-                    Some(h) => h,
-                    None => {
-                        return Err(config
-                            .error_handler(&mut req, VerifyErrorType::HeaderNotFound)
-                            .await)
-                    }
-                };
-
-                let mut encoder = match DeserializeJwsWriter::new(&jws, |h| config.get_verifier(h))
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        return Err(config
-                            .error_handler(&mut req, VerifyErrorType::Other(e))
-                            .await)
-                    }
-                };
-
-                let mut stream = req.take_payload();
-                while let Some(chunk) = stream.next().await {
-                    encoder.write_all(&chunk?)?;
+        async move {
+            let jws = match req.headers().get("x-jws-signature") {
+                Some(h) => h,
+                None => {
+                    return Err(config
+                        .error_handler(&mut req, VerifyErrorType::HeaderNotFound)
+                        .await)
                 }
+            };
 
-                let _ = match encoder.finish() {
-                    Ok(o) => o,
-                    Err(_) => {
-                        return Err(config
-                            .error_handler(&mut req, VerifyErrorType::IncorrectSignature)
-                            .await)
-                    }
-                };
+            let mut writer = match DeserializeJwsWriter::new(&jws, |h| config.get_verifier(h)) {
+                Ok(o) => o,
+                Err(e) => {
+                    return Err(config
+                        .error_handler(&mut req, VerifyErrorType::Other(e))
+                        .await)
+                }
+            };
+
+            let mut stream = req.take_payload();
+            while let Some(chunk) = stream.next().await {
+                writer.write_all(&chunk?)?;
             }
 
-            let mut response = svc.call(req).await?;
+            let _ = match writer.finish() {
+                Ok(o) => o,
+                Err(_) => {
+                    return Err(config
+                        .error_handler(&mut req, VerifyErrorType::IncorrectSignature)
+                        .await)
+                }
+            };
 
-            //response.take_body()
-
-            Ok(response)
-        })
+            svc.call(req).await
+        }
+        .boxed_local()
     }
 }

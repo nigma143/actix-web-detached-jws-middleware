@@ -1,52 +1,45 @@
-use std::{
-    borrow::{Borrow, BorrowMut},
-    fmt::Display,
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    marker::PhantomData,
-    path::{Path, PathBuf},
-    pin::Pin,
-    rc::Rc,
-    sync::Arc,
-    task::Poll,
-    thread,
-};
+use std::{io::Read, sync::Arc};
 
-use actix_service::{boxed::factory, Service, Transform};
 use actix_web::{
-    body::BodyStream,
-    dev::{Payload, ServiceRequest},
-    error::{ErrorForbidden, PayloadError},
-    get,
-    middleware::errhandlers::ErrorHandlers,
-    rt::{blocking, System},
-    web::{self, Bytes, BytesMut},
-    App, Error, FromRequest, HttpMessage, HttpResponse, HttpServer, Responder,
+    dev::ServiceRequest,
+    error::{ErrorForbidden, ErrorInternalServerError},
+    web::{self},
+    App, Error, HttpServer, Responder,
 };
 use actix_web_detached_jws_middleware::{
-    buffering::{enable_request_buffering, FileBufferingStreamBuilder},
-    verify::{DetachedJwsConfig, DetachedJwsVerify, ShouldVerify, VerifyErrorType},
+    DetachedJwsSign, DetachedJwsSignConfig, DetachedJwsVerify, DetachedJwsVerifyConfig,
+    VerifyErrorType,
 };
-use detached_jws::{JwsHeader, Verify};
-use executor::block_on_stream;
-use futures::{
-    executor,
-    future::{ok, ready, FutureExt, LocalBoxFuture, Ready},
-    Stream,
-};
-use futures::{Future, StreamExt};
+use detached_jws::JwsHeader;
+use futures::future::{ready, Ready};
 use openssl::{
     hash::MessageDigest,
     pkcs12::{ParsedPkcs12, Pkcs12},
-    pkey::PKey,
     rsa::Padding,
     sign::{Signer, Verifier},
 };
-use uuid::Uuid;
 
-#[get("/{id}/{name}/index.html")]
-async fn index(web::Path((id, name)): web::Path<(u32, String)>) -> impl Responder {
-    format!("Hello {}! id:{}", name, id)
+async fn index() -> impl Responder {
+    "this_is_response_body"
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let config = Arc::new(Config::new());
+
+    HttpServer::new(move || {
+        App::new()
+            .service(
+                web::resource("/protected")
+                    .wrap(DetachedJwsVerify::new(config.clone()))
+                    .wrap(DetachedJwsSign::new(config.clone()))
+                    .route(web::post().to(index)),
+            )
+            .service(web::resource("/simple").route(web::post().to(index)))
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
 }
 
 struct Config {
@@ -72,9 +65,8 @@ impl Config {
     }
 }
 
-impl<'a> DetachedJwsConfig<'a> for Config {
+impl<'a> DetachedJwsVerifyConfig<'a> for Config {
     type Verifier = Verifier<'a>;
-    type ShouldVerify = LocalBoxFuture<'a, ShouldVerify>;
     type ErrorHandler = Ready<Error>;
 
     fn get_verifier(&'a self, h: &JwsHeader) -> Option<Self::Verifier> {
@@ -95,63 +87,26 @@ impl<'a> DetachedJwsConfig<'a> for Config {
         }
     }
 
-    fn should_verify(&'a self, req: &'a mut ServiceRequest) -> Self::ShouldVerify {
-        async move {
-            let mut builder = FileBufferingStreamBuilder::new();
-
-            enable_request_buffering(builder, req);
-
-            /*
-            {
-                let mut body = BytesMut::new();
-
-                while let Some(chunk) = stream.next().await {
-                    body.extend_from_slice(&chunk.unwrap());
-                }
-
-                //println!("request body: {:?}", body);
-            }*/
-
-            { /*
-                 let mut body = BytesMut::new();
-
-                 while let Some(chunk) = stream.next().await {
-                     body.extend_from_slice(&chunk.unwrap());
-                 }*/
-
-                //println!("request body: {:?}", body);
-            }
-
-            true
-        }
-        .boxed_local()
-
-        //ready(req.headers().contains_key("X-JWS-Signature"))
-    }
-
     fn error_handler(
         &'a self,
-        req: &'a mut ServiceRequest,
+        _: &'a mut ServiceRequest,
         error: VerifyErrorType,
     ) -> Self::ErrorHandler {
         ready(match error {
             VerifyErrorType::HeaderNotFound => ErrorForbidden("Header Not Found"),
             VerifyErrorType::IncorrectSignature => ErrorForbidden("Incorrect Signature"),
-            VerifyErrorType::Other(e) => ErrorForbidden(e),
+            VerifyErrorType::Other(e) => ErrorInternalServerError(e),
         })
     }
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let config = Arc::new(Config::new());
+impl<'a> DetachedJwsSignConfig<'a> for Config {
+    type Signer = Signer<'a>;
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(DetachedJwsVerify::new(config.clone()))
-            .service(web::resource("/test").route(web::post().to(|| HttpResponse::Ok().body("dfsfsdf"))))
-    })
-    .bind("127.0.0.1:8080")?
-    .run()
-    .await
+    fn get_signer(&'a self) -> (Self::Signer, String, JwsHeader) {
+        let mut signer = Signer::new(MessageDigest::sha256(), &self.cert_ps256.pkey).unwrap();
+        signer.set_rsa_padding(Padding::PKCS1_PSS).unwrap();
+
+        (signer, "PS256".into(), JwsHeader::new())
+    }
 }

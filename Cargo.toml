@@ -2,6 +2,12 @@
 name = "actix-web-detached-jws-middleware"
 version = "0.1.0"
 authors = ["Irek Nigmatullin <nigma143@mail.ru>"]
+description = "Actix-web middleware to sign and verify detached jws"
+documentation = "http://docs.rs/actix-web-detached-jws-middleware/"
+repository = "http://github.com/nigma143/actix-web-detached-jws-middleware"
+readme = "README.md"
+keywords = ["actix", "actix-web", "jws", "detached", "middleware"]
+license  = "BSD-2-Clause"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,17 +16,16 @@ edition = "2018"
 futures = { version = "0.3" }
 actix-web = { version = "3" }
 actix-service = "1.0"
+actix-web-buffering = "0.1.0"
 detached-jws = "0.2.1"
 anyhow = "1.0.38"
-uuid = { version = "0.8.2", features = ["v4"] }
-pin-project = "1"
 
 [dev-dependencies]
 openssl = "0.10.32"
 actix-rt = "2.0.2"
 lazy_static = "1.4.0"
 anyhow = "1.0.38"
-pin-project = "1"
+actix-files = "0.5.0"
 
 [[example]]
 name = "main" # examples/main.rs
